@@ -1,0 +1,147 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helpers ----------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isCampusEmail() {
+      return request.auth.token.email != null
+        && request.auth.token.email.matches('^[^@]+@campus\\.edu$');
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Verified users and admins may use the app.
+    function canUse() {
+      return isVerified() || isAdmin();
+    }
+
+    // ---------- Users ----------
+
+    match /users/{userId} {
+      // Users read only their own profile; admins read all.
+      allow read: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+
+      // Self sign-up: campus email only, student or staff only, not suspended.
+      allow create: if isSignedIn()
+        && request.auth.uid == userId
+        && isCampusEmail()
+        && request.resource.data.role in ['student', 'staff']
+        && request.resource.data.isSuspended == false
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.createdAt == request.time;
+
+      // Users may edit their own name and campus ID only.
+      allow update: if canUse()
+        && request.auth.uid == userId
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.isSuspended == resource.data.isSuspended
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.createdAt == resource.data.createdAt;
+
+      // Admins may change any profile, including role and suspension.
+      allow update, delete: if isAdmin();
+    }
+
+    // ---------- Items ----------
+
+    match /items/{itemId} {
+      allow read: if canUse();
+
+      // Students report items with status open and no flags.
+      allow create: if canUse()
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.type in ['lost', 'found']
+        && request.resource.data.status == 'open'
+        && request.resource.data.isFlagged == false
+        && request.resource.data.flagCount == 0;
+
+      // Reporters edit their own items but cannot change status or flags.
+      allow update: if canUse()
+        && resource.data.reporterId == request.auth.uid
+        && request.resource.data.reporterId == resource.data.reporterId
+        && request.resource.data.status == resource.data.status
+        && request.resource.data.isFlagged == resource.data.isFlagged
+        && request.resource.data.flagCount == resource.data.flagCount;
+
+      // Reporters may delete their own items only while still open.
+      allow delete: if canUse()
+        && resource.data.reporterId == request.auth.uid
+        && resource.data.status == 'open';
+
+      // Admins can change anything (status, moderation).
+      allow update, delete: if isAdmin();
+
+      // Status history is written by admins only.
+      match /statusHistory/{historyId} {
+        allow read: if canUse();
+        allow create: if isAdmin();
+      }
+    }
+
+    // ---------- Claims ----------
+
+    match /claims/{claimId} {
+      allow read: if canUse()
+        && (resource.data.claimantId == request.auth.uid || isAdmin());
+
+      allow create: if canUse()
+        && request.resource.data.claimantId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time;
+
+      // Only admins approve or reject claims.
+      allow update, delete: if isAdmin();
+
+      match /messages/{messageId} {
+        function isParticipant() {
+          return get(/databases/$(database)/documents/claims/$(claimId)).data.claimantId == request.auth.uid
+            || isAdmin();
+        }
+
+        allow read: if canUse() && isParticipant();
+
+        allow create: if canUse()
+          && isParticipant()
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.createdAt == request.time;
+      }
+    }
+
+    // ---------- Notifications ----------
+
+    match /notifications/{notificationId} {
+      allow read: if canUse() && resource.data.userId == request.auth.uid;
+
+      // Users may only mark their own notifications as read.
+      allow update: if canUse()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']);
+
+      allow create, delete: if isAdmin();
+    }
+
+    // ---------- Flags ----------
+
+    match /flags/{flagId} {
+      allow create: if canUse()
+        && request.resource.data.reportedBy == request.auth.uid
+        && request.resource.data.createdAt == request.time;
+
+      allow read, update, delete: if isAdmin();
+    }
+  }
+}
